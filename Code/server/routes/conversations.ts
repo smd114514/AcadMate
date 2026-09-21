@@ -1,8 +1,11 @@
 import { Router, Response } from 'express';
+import fs from 'fs';
 import { authMiddleware, AuthRequest } from '../middleware/auth';
 import { getDb } from '../db';
+import { loadResearchDocument } from '../data/researchDocuments';
 import { agentBase, agentUrl, probeAgent } from '../harnessClient';
 import { apiSettingsRequired, getLlmApiSettings, hasUsableLlmSettings } from '../services/llmSettings';
+import { extractPdfText } from './pdfText';
 import {
   RESEARCH_ASSISTANT_INSTRUCTIONS,
   explainResearchStreamError,
@@ -110,6 +113,20 @@ conversationsRouter.patch('/:id', (req: AuthRequest, res: Response) => {
   res.json(conversationRead(req.userId!, id));
 });
 
+/** Permanently delete one of the current user's conversations. Related goals
+ * and messages are removed by the database's ON DELETE CASCADE constraints. */
+conversationsRouter.delete('/:id', (req: AuthRequest, res: Response) => {
+  const id = parseId(req.params.id);
+  if (!id || !userConversation(req.userId!, id)) {
+    res.status(404).json({ message: '会话不存在' });
+    return;
+  }
+  const result = getDb()
+    .prepare('DELETE FROM conversations WHERE id=? AND user_id=?')
+    .run(id, req.userId!);
+  res.json({ deleted: result.changes });
+});
+
 conversationsRouter.post('/:id/goals', (req: AuthRequest, res: Response) => {
   const id = parseId(req.params.id);
   if (!id || !userConversation(req.userId!, id)) { res.status(404).json({ message: '会话不存在' }); return; }
@@ -163,6 +180,29 @@ function flushStream(res: Response): void {
   if (typeof flushable.flush === 'function') flushable.flush();
 }
 
+type PdfAttachmentContext = { uploadId: string; filename: string; text: string };
+
+/** A PDF belongs to a user-scoped document store. Resolve it again here so a
+ * conversation cannot reference another user's upload id. */
+async function loadPdfAttachmentContext(uploadId: string, userId: number): Promise<PdfAttachmentContext | null> {
+  try {
+    const document = loadResearchDocument(userId, uploadId);
+    if (!document || !fs.existsSync(document.storedPath)) return null;
+    const text = document.extractedText?.trim() || await extractPdfText(document.storedPath);
+    if (!text.trim()) return { uploadId, filename: document.originalName || 'PDF 附件', text: '' };
+    return {
+      uploadId,
+      filename: document.originalName || 'PDF 附件',
+      // AgentMessageRequest limits extra instructions to 6000 characters.
+      // Keep a bounded, whitespace-normalized excerpt so the attached paper
+      // and typed question are considered in one model request.
+      text: text.replace(/\s+/g, ' ').trim().slice(0, 5200),
+    };
+  } catch {
+    return null;
+  }
+}
+
 conversationsRouter.post('/:id/messages/stream', async (req: AuthRequest, res: Response) => {
   const id = parseId(req.params.id);
   const conversation = id ? userConversation(req.userId!, id) : undefined;
@@ -173,8 +213,21 @@ conversationsRouter.post('/:id/messages/stream', async (req: AuthRequest, res: R
     res.status(428).json(apiSettingsRequired(conversation.surface === 'research' ? '科研对话' : '智能对话'));
     return;
   }
+  const uploadId = typeof req.body?.upload_id === 'string' ? req.body.upload_id.trim() : '';
+  const pdfAttachment = uploadId ? await loadPdfAttachmentContext(uploadId, req.userId!) : null;
+  if (uploadId && !pdfAttachment) {
+    res.status(404).json({ message: '找不到该 PDF 附件，或它不属于当前用户' });
+    return;
+  }
+  if (pdfAttachment && !pdfAttachment.text) {
+    res.status(400).json({ message: 'PDF 未能提取可检索正文；扫描件、图片 PDF 或加密文档暂不支持随对话检索' });
+    return;
+  }
   const db = getDb();
-  db.prepare('INSERT INTO conversation_messages (conversation_id, user_id, role, content) VALUES (?, ?, ?, ?)').run(id, req.userId!, 'user', message);
+  db.prepare('INSERT INTO conversation_messages (conversation_id, user_id, role, content, metadata_json) VALUES (?, ?, ?, ?, ?)')
+    .run(id, req.userId!, 'user', message, JSON.stringify(pdfAttachment ? {
+      attachment: { upload_id: pdfAttachment.uploadId, filename: pdfAttachment.filename },
+    } : {}));
   db.prepare("UPDATE conversations SET updated_at=datetime('now','localtime') WHERE id=? AND user_id=?").run(id, req.userId!);
   const activePaperId = parseId(req.body?.active_paper_id);
   if (activePaperId) {
@@ -218,6 +271,9 @@ conversationsRouter.post('/:id/messages/stream', async (req: AuthRequest, res: R
       'SELECT name, description, prompt_template, permissions FROM custom_skills WHERE user_id=? AND status=\'enabled\' ORDER BY updated_at DESC LIMIT 6',
     ).all(req.userId!) as Array<{ name: string; description: string; prompt_template: string; permissions: string }>;
     const extraInstructions = [
+      pdfAttachment
+        ? `用户在本轮附上了 PDF《${pdfAttachment.filename}》。请将下列论文正文摘录与用户问题一起分析；若摘录不足以支持结论，请明确说明。\n\n${pdfAttachment.text}`
+        : '',
       conversation.surface === 'research' ? RESEARCH_ASSISTANT_INSTRUCTIONS : '',
       activeGoal ? `当前会话目标：${String((activeGoal as any).title || '')}${(activeGoal as any).description ? `\n目标说明：${String((activeGoal as any).description)}` : ''}` : '',
       enabledSkills.length ? `用户已启用以下声明式 Skill。仅在当前问题相关且权限允许时参考，不要声称已执行未授权工具：\n${enabledSkills.map((skill) => `- ${skill.name}：${skill.description || '无说明'}\n  指令：${String(skill.prompt_template || '').slice(0, 1800)}`).join('\n')}` : '',

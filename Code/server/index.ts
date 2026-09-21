@@ -23,6 +23,7 @@ import { researchRouter } from './routes/research.js';
 import { skillsRouter } from './routes/skills.js';
 import { integrationsRouter } from './routes/integrations.js';
 import { papersRouter } from './routes/papers.js';
+import { memoriesRouter } from './routes/memories.js';
 import { getDb } from './db.js';
 import { reconcilePendingGrowthWrites } from './routes/agent.js';
 import { agentBase, probeAgent } from './harnessClient.js';
@@ -69,6 +70,7 @@ app.use('/api/research', researchRouter);
 app.use('/api/skills', skillsRouter);
 app.use('/api/integrations', integrationsRouter);
 app.use('/api/papers', papersRouter);
+app.use('/api/memories', memoriesRouter);
 
 // ---- 健康检查 ----
 app.get('/api/health', (_req, res) => {

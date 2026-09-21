@@ -333,6 +333,23 @@ const PDF_ANALYSIS_DDL = `
         ON pdf_analysis_jobs(user_id, document_id, status);
 `;
 
+/** Explicit long-term memories. These are deliberately separate from the
+ * research-growth evidence used by profile generation. */
+const USER_MEMORIES_DDL = `
+      CREATE TABLE IF NOT EXISTS user_memories (
+        id          INTEGER PRIMARY KEY AUTOINCREMENT,
+        user_id     INTEGER NOT NULL,
+        content     TEXT NOT NULL,
+        source      TEXT NOT NULL DEFAULT 'user',
+        created_at  TEXT DEFAULT (datetime('now','localtime')),
+        updated_at  TEXT DEFAULT (datetime('now','localtime')),
+        FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE
+      );
+
+      CREATE INDEX IF NOT EXISTS idx_user_memories_user
+        ON user_memories(user_id, updated_at DESC, id DESC);
+`;
+
 /** 按版本号递增的迁移步骤；下标 = 目标版本（第 n 步把库升到 n）。只允许 SQLite 支持的 DDL。 */
 const MIGRATIONS: { version: number; sql: string }[] = [
   // 版本 1：基线（初始 5 张表 + 2 索引）。这一步既建空库也把旧库标记为己迁移。
@@ -803,6 +820,7 @@ export function ensureProductivitySchema(database: Database.Database): void {
   database.exec(EMAIL_ACCOUNTS_DDL);
   ensureColumn(database, 'email_accounts', 'imap_same_as_smtp', 'imap_same_as_smtp INTEGER NOT NULL DEFAULT 0');
   database.exec(PDF_ANALYSIS_DDL);
+  database.exec(USER_MEMORIES_DDL);
   ensureColumn(database, 'email_outbox', 'attachments_json', "attachments_json TEXT NOT NULL DEFAULT '[]'");
   ensureColumn(database, 'plans', 'completed_at', 'completed_at TEXT');
   ensureColumn(database, 'plans', 'parent_plan_id', 'parent_plan_id INTEGER');

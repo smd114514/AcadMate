@@ -217,6 +217,19 @@ pdfRouter.get('/documents', (req: AuthRequest, res: Response) => {
   res.json({ items: listResearchDocuments(req.userId!) });
 });
 
+/** Open a PDF only after resolving its id within the current user's document
+ * store. The client never receives the on-disk storage path. */
+pdfRouter.get('/documents/:documentId/file', (req: AuthRequest, res: Response) => {
+  const record = loadResearchDocument(req.userId!, req.params.documentId);
+  if (!record || !fs.existsSync(record.storedPath)) {
+    res.status(404).json({ message: '文档不存在、已缺失或不属于当前用户' });
+    return;
+  }
+  res.setHeader('Content-Type', 'application/pdf');
+  res.setHeader('Content-Disposition', `inline; filename*=UTF-8''${encodeURIComponent(record.originalName || 'document.pdf')}`);
+  res.sendFile(record.storedPath);
+});
+
 pdfRouter.get('/jobs/:jobId', (req: AuthRequest, res: Response) => {
   const job = getPdfAnalysisJob(req.userId!, req.params.jobId);
   if (!job) {
