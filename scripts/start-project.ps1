@@ -65,8 +65,9 @@ function Get-NodeVersion([string]$Node) {
 }
 
 function Test-SupportedNode([hashtable]$Version) {
-    return ($Version.Major -gt 22) -or
-        ($Version.Major -eq 22 -and $Version.Minor -ge 12)
+    # better-sqlite3 in the locked dependency graph requires a supported
+    # Node ABI. Keep new machines on the tested Node 22 LTS line.
+    return $Version.Major -eq 22 -and $Version.Minor -ge 12
 }
 
 function Test-NodeRuntime([string]$Node) {
@@ -78,18 +79,29 @@ function Test-NodeRuntime([string]$Node) {
 }
 
 function Ensure-Node {
-    $node = Find-Command 'node.exe'
+    # An installer updates PATH only for new shells.  The explicit fallback
+    # keeps first-run preparation reliable from a pre-existing PowerShell.
+    $node = Find-Command 'node.exe' @('%ProgramFiles%\nodejs\node.exe')
+    if (-not $node) {
+        $portable = Get-ChildItem -Path (Join-Path $env:LOCALAPPDATA 'Microsoft\WinGet\Packages\OpenJS.NodeJS.22_*\node-*\node.exe') -ErrorAction SilentlyContinue | Select-Object -First 1
+        if ($portable) { $node = $portable.FullName }
+    }
     $version = if ($node) { Get-NodeVersion $node } else { $null }
     if (-not $version -or -not (Test-SupportedNode $version)) {
-        if ($version) { Write-Warn "Node.js $($version.Raw) is unsupported; this project requires >=22.12.0 for better-sqlite3." }
-        Install-WingetPackage 'OpenJS.NodeJS.LTS' 'Node.js LTS'
+        if ($version) { Write-Warn "Node.js $($version.Raw) is unsupported; this project requires Node.js 22.12+ for better-sqlite3." }
+        Install-WingetPackage 'OpenJS.NodeJS.22' 'Node.js 22 LTS'
         $node = Find-Command 'node.exe' @('%ProgramFiles%\nodejs\node.exe')
         $version = if ($node) { Get-NodeVersion $node } else { $null }
     }
-    if (-not $version -or -not (Test-SupportedNode $version)) { Stop-Startup 'A supported Node.js version (>=22.12.0) is still unavailable. Restart Windows after installation, then rerun.' }
+    if (-not $version -or -not (Test-SupportedNode $version)) { Stop-Startup 'Node.js 22.12+ is still unavailable. Restart Windows after installation, then rerun.' }
     if (-not (Test-NodeRuntime $node)) { Stop-Startup 'Node.js is present but cannot execute JavaScript. Repair or reinstall Node.js LTS, then rerun.' }
     $npm = Find-Command 'npm.cmd' @('%ProgramFiles%\nodejs\npm.cmd')
+    if (-not $npm -and $node) {
+        $portableNpm = Join-Path (Split-Path -Parent $node) 'npm.cmd'
+        if (Test-Path -LiteralPath $portableNpm) { $npm = $portableNpm }
+    }
     if (-not $npm) { Stop-Startup 'npm was not found next to Node.js. Reinstall Node.js LTS.' }
+    $env:Path = "$(Split-Path -Parent $node);$env:Path"
     Write-Ok "Node.js $($version.Raw) / npm $(& $npm --version)"
     return @{ Node = $node; Npm = $npm }
 }
@@ -103,6 +115,24 @@ function Ensure-Uv {
     if (-not $uv) { Stop-Startup 'uv is still unavailable. Sign out or reboot after installation, then rerun.' }
     Write-Ok "$(& $uv --version)"
     return $uv
+}
+
+function Test-VisualCppBuildTools {
+    $vswhere = Find-Command 'vswhere.exe' @('%ProgramFiles(x86)%\Microsoft Visual Studio\Installer\vswhere.exe')
+    if (-not $vswhere) { return $false }
+    $installation = (& $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath 2>$null | Select-Object -First 1).Trim()
+    return -not [string]::IsNullOrWhiteSpace($installation)
+}
+
+function Ensure-VisualCppBuildTools {
+    if (Test-VisualCppBuildTools) { Write-Ok 'Visual C++ Build Tools are available'; return }
+    $winget = Find-Command 'winget.exe' @('%LOCALAPPDATA%\Microsoft\WindowsApps\winget.exe')
+    if (-not $winget) { Stop-Startup 'Visual C++ Build Tools are required for better-sqlite3, but winget is unavailable. Install the Desktop development with C++ workload, then rerun.' }
+    if (-not (Confirm-Install 'Visual C++ Build Tools (required to compile better-sqlite3)')) { Stop-Startup 'Visual C++ Build Tools are required. Installation was declined.' }
+    Write-Step 'Installing Visual C++ Build Tools (this is a large, one-time download)'
+    & $winget install --id Microsoft.VisualStudio.2022.BuildTools --exact --accept-package-agreements --accept-source-agreements --override '--wait --quiet --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended'
+    if ($LASTEXITCODE -ne 0 -or -not (Test-VisualCppBuildTools)) { Stop-Startup 'Visual C++ Build Tools installation did not complete. Install the Desktop development with C++ workload, then rerun.' }
+    Write-Ok 'Visual C++ Build Tools are ready'
 }
 
 function Ensure-Docker {
@@ -212,6 +242,7 @@ function Ensure-EnvFiles {
 
 function Ensure-Dependencies([string]$Npm, [string]$Uv) {
     Write-Step 'Checking D-side Node dependencies'
+    Ensure-VisualCppBuildTools
     Push-Location $CodeRoot
     try {
         # Windows PowerShell can promote npm's diagnostic stderr to a
